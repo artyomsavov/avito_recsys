@@ -1,0 +1,19 @@
+# Данные и кэш
+data/
+*.parquet
+*.csv
+.ipynb_checkpoints/
+
+# Виртуальная среда
+venv/
+.env
+
+# Логи и модели
+models/*.pkl
+models/*.bin
+
+# Vim swap files
+*.swp
+*.swo
+*.swn
+.sw?
