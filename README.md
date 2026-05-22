@@ -9,7 +9,7 @@
 ### 1. Склонируйте репозиторий
 
 ```bash
-git clone git@github.com:ваш_логин/avito_recsys.git
+git clone git@github.com:artyomsavov/avito_recsys.git
 cd avito_recsys
 ```
 
