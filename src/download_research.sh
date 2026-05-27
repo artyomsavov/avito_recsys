@@ -2,9 +2,12 @@
 # Скрипт для локальной разработки и отладки (train 20/100 part)
 # Запуск: bash src/download_research.sh
 
-RAW_DIR="data/raw"
-mkdir -p $RAW_DIR
-cd $RAW_DIR
+# Определяем корень проекта
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RAW_DIR="${PROJECT_ROOT}/data/raw"
+
+mkdir -p "$RAW_DIR"
+cd "$RAW_DIR" || exit
 
 BASE="https://storage.yandexcloud.net/datafest2026/datafest_2026_v2_v4"
 

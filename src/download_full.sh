@@ -2,9 +2,11 @@
 # Скрипт для полного скачивания (весь кликстрим 40+ ГБ)
 # Запуск: bash src/download_full.sh
 
-RAW_DIR="data/raw"
-mkdir -p $RAW_DIR
-cd $RAW_DIR
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RAW_DIR="${PROJECT_ROOT}/data/raw"
+
+mkdir -p "$RAW_DIR"
+cd "$RAW_DIR" || exit
 
 BASE="https://storage.yandexcloud.net/datafest2026/datafest_2026_v2_v4"
 
@@ -25,8 +27,7 @@ for i in 000-019 020-039 040-059 060-079 080-099; do
     echo "-> Обработка блока train_${i}..."
     curl -O -C - $BASE/train_${i}.zip
     unzip -o train_${i}.zip
-    # Удаляем архив ДО скачивания следующего, чтобы не раздувать диск
-    rm -f train_${i}.zip 
+    rm -f train_${i}.zip
 done
 
 echo "[Full] Готово! Полный датасет развернут."
