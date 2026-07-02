@@ -11,6 +11,7 @@ venv/
 # Логи и модели
 models/*.pkl
 models/*.bin
+logs/
 
 # Vim swap files
 *.swp

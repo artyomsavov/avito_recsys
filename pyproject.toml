@@ -1,0 +1,25 @@
+[project]
+name = "avito-recsys"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "catboost>=1.2.10",
+    "implicit>=0.7.3",
+    "jupyterlab>=4.5.7",
+    "lightgbm>=4.6.0",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.4",
+    "pandas>=3.0.3",
+    "plotly>=6.7.0",
+    "polars>=1.40.1",
+    "pyarrow>=24.0.0",
+    "requests>=2.34.2",
+    "scienceplots>=2.2.1",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "tqdm>=4.67.3",
+]
+
