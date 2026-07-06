@@ -9,22 +9,16 @@ dependencies = [
     "scipy",
     "pandas",
     "beartype",
-]
-
-[project.optional-dependencies]
-gpu = [
     "implicit>=0.7",
     "catboost>=1.2",
 ]
-notebook = [
+
+[dependency-groups]
+dev = [
+    "ruff",
     "ipykernel",
     "matplotlib",
-    "nbstripout", # чтобы не коммитить выводы ячеек и картинки
-]
-
-[tool.uv]
-dev-dependencies = [
-    "ruff",
+    "nbstripout",
 ]
 
 [tool.ruff]
@@ -32,5 +26,5 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-# E, F - базовые ошибки, I - сортировка импортов, UP - современный синтаксис, PT - pytest (на будущее)
+# E, F - база, I - сортировка импортов, UP - современный синтаксис, PT - pytest
 select = ["E", "F", "I", "UP", "PT"]

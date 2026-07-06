@@ -44,6 +44,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "beartype" },
+    { name = "catboost" },
+    { name = "implicit" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -54,40 +56,33 @@ dependencies = [
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
-[package.optional-dependencies]
-gpu = [
-    { name = "catboost" },
-    { name = "implicit" },
-]
-notebook = [
+[package.dev-dependencies]
+dev = [
     { name = "ipykernel" },
     { name = "matplotlib" },
     { name = "nbstripout" },
-]
-
-[package.dev-dependencies]
-dev = [
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "beartype" },
-    { name = "catboost", marker = "extra == 'gpu'", specifier = ">=1.2" },
-    { name = "implicit", marker = "extra == 'gpu'", specifier = ">=0.7" },
-    { name = "ipykernel", marker = "extra == 'notebook'" },
-    { name = "matplotlib", marker = "extra == 'notebook'" },
-    { name = "nbstripout", marker = "extra == 'notebook'" },
+    { name = "catboost", specifier = ">=1.2" },
+    { name = "implicit", specifier = ">=0.7" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "polars", specifier = ">=1.0" },
     { name = "pyarrow" },
     { name = "scipy" },
 ]
-provides-extras = ["gpu", "notebook"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "ruff" }]
+dev = [
+    { name = "ipykernel" },
+    { name = "matplotlib" },
+    { name = "nbstripout" },
+    { name = "ruff" },
+]
 
 [[package]]
 name = "beartype"
