@@ -1,12 +1,32 @@
-# Данные и кэш
-data/
+# Окружение и кэш
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Данные 
+data/raw/*
+data/interim/*
+data/processed/*
+data/features/*
+submits/*
 *.parquet
 *.csv
-.ipynb_checkpoints/
 
-# Виртуальная среда
-venv/
-.env
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!data/features/.gitkeep
+!submits/.gitkeep
+
+# Глобальные маски артефактов
+*.parquet
+*.npz
+*.cbm
+*.csv
+
+# Ноутбуки
+.ipynb_checkpoints/
 
 # Логи и модели
 models/*.pkl
