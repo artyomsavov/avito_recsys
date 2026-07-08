@@ -29,8 +29,6 @@ submits/*
 .ipynb_checkpoints/
 
 # Логи и модели
-models/*.pkl
-models/*.bin
 logs/
 
 # Vim swap files
@@ -38,3 +36,8 @@ logs/
 *.swo
 *.swn
 .sw?
+
+# mics
+catboost_info/
+data/duckdb_tmp/
+*.npy

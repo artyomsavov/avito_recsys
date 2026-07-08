@@ -15,7 +15,6 @@ def build_sparse_matrix() -> None:
     df = pl.read_parquet(INTERIM_DIR / "interactions_agg.parquet")
 
     print("2. Создаем словари маппинга (ID -> Index)...")
-    # Извлекаем уникальные ID и сортируем для детерминированности
     unique_users = df["user_id"].unique().sort().to_numpy()
     unique_items = df["item_id"].unique().sort().to_numpy()
 
@@ -34,7 +33,7 @@ def build_sparse_matrix() -> None:
     print("4. Собираем COO матрицу и конвертируем в CSR...")
     rows = df["user_idx"].to_numpy()
     cols = df["item_idx"].to_numpy()
-    data = df["weight"].to_numpy().astype(np.float32)  # float32 for ALS
+    data = df["weight"].to_numpy().astype(np.float32)
 
     shape = (len(unique_users), len(unique_items))
     sparse_mat = coo_matrix((data, (rows, cols)), shape=shape).tocsr()
