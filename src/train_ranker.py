@@ -13,7 +13,10 @@ CAT_FEATURES = ["vertical_id", "category_ext_y", "region_id_y", "loc_id_y"]
 FEATURE_COLS = [
     "als_score",
     "als_rank",
-    "is_cold",
+    "covisit_score",
+    "covisit_rank",
+    "in_als",
+    "in_covisit",
     "vertical_id",
     "category_ext_y",
     "region_id_y",
@@ -28,13 +31,11 @@ SEED = 42
 
 def train_ranker() -> None:
     print("1. Загружаем фичи...")
-    df = pl.read_parquet(FEATURES_DIR / "train_features_synth.parquet")
+    df = pl.read_parquet(FEATURES_DIR / "train_features_merged.parquet")
 
     # CatBoost хочет числа
     df = df.with_columns(
         [
-            pl.col("is_cold").cast(pl.Int8),
-            pl.col("user_top_vertical_match").cast(pl.Int8),
             pl.col("target").cast(pl.Int8),
         ]
     )
@@ -100,6 +101,7 @@ def train_ranker() -> None:
     imp = model.get_feature_importance(type="PredictionValuesChange")
     for name, val_imp in sorted(zip(FEATURE_COLS, imp), key=lambda x: -x[1]):
         print(f"   {name:28s} {val_imp:6.2f}")
+
 
 if __name__ == "__main__":
     train_ranker()

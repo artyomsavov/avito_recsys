@@ -37,8 +37,8 @@ def recall_at_k(preds: pl.DataFrame, score_col: str, full_target: pl.DataFrame) 
 
 def main() -> None:
     val = pl.read_parquet(FEATURES_DIR / "val_predictions.parquet")
-    feats = pl.read_parquet(FEATURES_DIR / "train_features_synth.parquet").select(
-        ["user_id", "item_id", "als_score"]
+    feats = pl.read_parquet(FEATURES_DIR / "train_features_merged.parquet").select(
+        ["user_id", "item_id", "als_score", "covisit_score"]
     )
     val = val.join(feats, on=["user_id", "item_id"], how="left")
 
@@ -46,10 +46,14 @@ def main() -> None:
     full_target = pl.read_csv(RAW_DIR / "local_eval.csv").filter(pl.col("user_id").is_in(val_users))
 
     n_users = full_target["user_id"].n_unique()
+
     print(f"Val-юзеров с таргетом (из local_eval.csv): {n_users:,}")
 
     recall_als = recall_at_k(val, "als_score", full_target)
     recall_ranker = recall_at_k(val, "rank_score", full_target)
+    recall_covisit = recall_at_k(val, "covisit_score", full_target)
+
+    print(f"Recall@{K} — голый covisit:    {recall_covisit:.4f}")
     print(f"Recall@{K} — голый ALS:        {recall_als:.4f}")
     print(f"Recall@{K} — CatBoost ranker:  {recall_ranker:.4f}")
     if recall_als > 0:
