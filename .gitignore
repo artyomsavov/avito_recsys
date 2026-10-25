@@ -4,40 +4,29 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 
-# Данные 
-data/raw/*
-data/interim/*
-data/processed/*
-data/features/*
-submits/*
-*.parquet
-*.csv
-
-!data/raw/.gitkeep
-!data/interim/.gitkeep
-!data/processed/.gitkeep
-!data/features/.gitkeep
-!submits/.gitkeep
+# Данные и артефакты прогонов (data/raw, data/runs/<run>, ...)
+data/*
+!data/.gitkeep
 
 # Глобальные маски артефактов
 *.parquet
-*.npz
-*.cbm
+*.pq
 *.csv
+*.npz
+*.npy
+*.cbm
+catboost_info/
 
 # Ноутбуки
 .ipynb_checkpoints/
 
-# Логи и модели
+# Логи
 logs/
+*.log
 
 # Vim swap files
-*.swp
-*.swo
-*.swn
-.sw?
+*.sw[a-p]
 
-# mics
-catboost_info/
-data/duckdb_tmp/
-*.npy
+# Замороженный val-сплит ранкера — нужен для воспроизводимости, хранится в git
+!data/splits/
+!data/splits/*.csv

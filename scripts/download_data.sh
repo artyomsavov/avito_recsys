@@ -1,5 +1,7 @@
 #!/bin/bash
-# Бронебойный скрипт для скачивания при слабом/нестабильном интернете
+# Скачивание данных для пайплайна (докачка при нестабильном интернете):
+# item_features, contact_eids и полный train (100 партиций, ~40 GB).
+# Таргет synth-валидации после скачивания: bash scripts/make_local_eval.sh
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RAW_DIR="${PROJECT_ROOT}/data/raw"
@@ -34,31 +36,11 @@ download_reliable() {
     done
 }
 
-echo "[1/3] Скачивание базовых файлов..."
+echo "[1/2] Скачивание базовых файлов..."
 download_reliable "$BASE/item_features.parquet"
 download_reliable "$BASE/contact_eids.csv"
-download_reliable "$BASE/eval_users.csv"
-download_reliable "$BASE/prepare_local_eval.py"
-download_reliable "$BASE/popular.py"
 
-echo "[2/3] Обработка истории пользователей..."
-# Проверяем, есть ли уже распакованный файл (в твоем дереве он называется eval_user_events.pq)
-if [ ! -f "eval_user_events.pq" ]; then
-    download_reliable "$BASE/eval_user_events.zip"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') | Начинаю распаковку eval_user_events.zip..."
-    
-    if unzip -o eval_user_events.zip; then
-        rm -f eval_user_events.zip
-        echo "$(date '+%Y-%m-%d %H:%M:%S') | [Успех] eval_user_events распакован. Архив удален."
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') | [ОШИБКА] Не удалось распаковать eval_user_events.zip. Скрипт остановлен."
-        exit 1
-    fi
-else
-    echo "-> eval_user_events.pq уже существует, пропускаем скачивание."
-fi
-
-echo "[3/3] Скачивание и потоковая распаковка полного трейна..."
+echo "[2/2] Скачивание и потоковая распаковка полного трейна..."
 for i in 000-019 020-039 040-059 060-079 080-099; do
     # Узнаем номер последнего файла в текущем блоке (например, 019)
     LAST_PART=$(echo $i | cut -d'-' -f2)
@@ -89,4 +71,4 @@ for i in 000-019 020-039 040-059 060-079 080-099; do
 done
 
 echo "=================================================="
-echo "$(date '+%Y-%m-%d %H:%M:%S') | [Full] Готово! Полный датасет развернут."
+echo "$(date '+%Y-%m-%d %H:%M:%S') | Готово! Данные развернуты."

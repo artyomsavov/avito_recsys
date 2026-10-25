@@ -1,69 +1,50 @@
+"""Сырой кликстрим -> агрегат (user, item, weight, last_timestamp) за окно до cutoff."""
+
 from pathlib import Path
 
 import polars as pl
 
-DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
-INTERIM_DIR = DATA_DIR / "interim"
-INTERIM_DIR.mkdir(parents=True, exist_ok=True)
-
-CUTOFF_MS = 1776211200000
-DAYS_28_MS = 28 * 24 * 60 * 60 * 1000
-START_MS = CUTOFF_MS - DAYS_28_MS
+from config import TRAIN_PARTS, Run, contact_eids, parse_run, window_filter
 
 MAX_ITEMS_PER_USER = 100
 WEIGHT_CLICK = 1
 WEIGHT_CONTACT = 5
 
 
-def aggregate_interactions() -> None:
-    print("1. Читаем список целевых контактов...")
-    contact_df = pl.read_csv(RAW_DIR / "contact_eids.csv")
-    contact_eids = contact_df["mapped_eid"].to_list()
-
-    print("2. Сканируем партиции и строим план запроса...")
-    lf = pl.scan_parquet(RAW_DIR / "train_data" / "part_*.parquet")
-
-    # отрезаем по времени и дропаем показы (eid=7)
-    lf = lf.filter(
-        (pl.col("timestamp") >= START_MS) & (pl.col("timestamp") < CUTOFF_MS) & (pl.col("eid") != 7)
-    )
-
-    # если контакт 5, если клик/избранное 1
-    lf = lf.with_columns(
-        pl.when(pl.col("eid").is_in(contact_eids))
+def aggregate(lf: pl.LazyFrame, run: Run, out_path: Path) -> None:
+    lf = lf.filter(window_filter(run)).with_columns(
+        # если контакт 5, если клик/избранное 1
+        pl.when(pl.col("eid").is_in(contact_eids()))
         .then(WEIGHT_CONTACT)
         .otherwise(WEIGHT_CLICK)
         .cast(pl.UInt8)
         .alias("event_weight")
     )
-
-    # взаимодействия пользователя с конкретным объявлением
-    agg_lf = lf.group_by(["user_id", "item_id"]).agg(
-        [
+    df_agg = (
+        lf.group_by(["user_id", "item_id"])
+        .agg(
             pl.col("event_weight").sum().cast(pl.UInt16).alias("weight"),
             pl.col("timestamp").max().alias("last_timestamp"),
-        ]
+        )
+        .collect(engine="streaming")
     )
+    print(f"   {len(df_agg):,} уникальных пар user-item")
 
-    print("3. Запускаем потоковую обработку (это займет несколько минут)...")
-    df_agg = agg_lf.collect(engine="streaming")
-
-    print(f"   Сжатие завершено. Получено {len(df_agg):,} уникальных пар user-item.")
-
-    print("4. Применяем лимит: оставляем топ-100 свежих действий на пользователя...")
+    # топ-100 свежих действий на пользователя
     df_final = (
         df_agg.sort(["user_id", "last_timestamp"], descending=[False, True])
         .group_by("user_id")
         .head(MAX_ITEMS_PER_USER)
     )
-
-    out_path = INTERIM_DIR / "interactions_agg.parquet"
+    assert df_final["last_timestamp"].max() < run.cutoff_ms, "событие после cutoff"
     df_final.write_parquet(out_path)
+    print(f"   {len(df_final):,} строк -> {out_path}")
 
-    print(f"Готово! Финальный размер: {len(df_final):,} строк.")
-    print(f"Файл сохранен в: {out_path}")
+
+def main() -> None:
+    run = parse_run(__doc__)
+    aggregate(pl.scan_parquet(TRAIN_PARTS), run, run.interim / "interactions_agg.parquet")
 
 
 if __name__ == "__main__":
-    aggregate_interactions()
+    main()
