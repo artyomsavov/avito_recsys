@@ -1,6 +1,7 @@
 # %% [markdown]
 # # Avito RecSys: финальный пайплайн
-# Кандидаты — блуждания item → сущность → item (юзер × категория × регион, юзер × день, юзер), ранжирование — CatBoost YetiRank.
+# Кандидаты — блуждания item → сущность → item (юзер × категория × регион, юзер × день, юзер), co-visitation и BM25 на тех же графах,
+# популярное в сегментах s0 × loc юзера; ранжирование — CatBoost YetiRank.
 # Ранкер учится на неделе до порога (W1), тест — неделя после (W0, таргет по логике организаторов).
 # Меняется только `SAMPLE`: 0.01 — одна партиция (ноутбук), 1.0 — весь датасет (сервер).
 
@@ -15,17 +16,17 @@ if need := [f"{p}{'[ctk]' * p.startswith('cupy')}=={v}" for p, v in PKGS.items()
 import numpy as np, polars as pl, scipy.sparse as ssp; from catboost import CatBoostRanker, Pool
 if GPU: import cupy as cp, cupyx.scipy.sparse as csp
 xp, xsp, cpu = (cp, csp, lambda a: a.get()) if GPU else (np, ssp, lambda a: a)
-RAW, OUT, DAY, H, K, SHOW, SEED = "data/raw", "data/final", 86_400_000, 3_600_000, 160, 7, 42
+RAW, OUT, DAY, H, K, SHOW, SEED, OOM = "data/raw", "data/final", 86_400_000, 3_600_000, 160, 7, 42, ("emory", "ALLOC", "RESOURCES", "bad_alloc")
 T0, END, T1 = 1_775_595_600_000, 1_776_211_200_000, 1_775_595_600_000 - 7 * DAY  # тест: порог local_eval.csv (04-07 21:00Z), конец train, обучение ранкера
 CONTACT, BUCKETS = [0, 2, 4, 5, 6, 8, 9, 11, 14, 15, 16], (("v0", (0,)), ("v2", (2,)), ("v3", (3,)), ("v4", (4,)), ("v57", (5, 7)))
-HIST, W_CONTACT, W_SHOW, TAU, SEEDS, CAP_ITEM, CAP_ENT, NOUT, NEG, BETA = 28, 3.0, 0.3, 7.0, 100, 300, 200, 500, 50, 0.0
+HIST, W_CONTACT, W_SHOW, TAU, SEEDS, CAP_ITEM, CAP_ENT, NOUT, NEG = 28, 3.0, 0.3, 7.0, 100, 300, 200, 1000, 50  # β = 0: без деления на популярность
+K1, B, NNZ_MAX, SP = 100.0, 0.8, 1_500_000_000, (20, 100, 300)  # BM25; блок графа < 2^31 nnz (индексы cupyx — int32); sp: сегментов, item на сегмент, кандидатов
 WALKS = {"cr": ("cat", "reg"), "s24": ("b",), "u0": ()}  # сущность = юзер × атрибуты item; b — день события
 ATTRS = {"vertical_id": "vert", "category_ext_y": "cat", "region_id_y": "reg", "loc_id_y": "loc", "sid_0_y": "s0", "sid_1_y": "s1", "sid_2_y": "s2"}
 AFF = {"cat": ["cat"], "reg": ["reg"], "loc": ["loc"], "s0": ["s0"], "s01": ["s0", "s1"], "s012": ["s0", "s1", "s2"], "vert": ["vert"]}
 CATS, DROP = ["vert", "cat", "reg", "loc", "s0"], {"user_id", "item_id", "ci", "target", "s1", "s2"}
 MEM_GB, GB_PER_PART = (cp.cuda.Device().mem_info[1] if GPU else os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / 2**30, 0.4  # графы в VRAM/RAM; пик на граф×партицию (замер 30%: ~0.33 GB)
-T_START, day = time.time(), lambda c: time.strftime("%m-%d", time.gmtime(c / 1000))
-merge = lambda fs: functools.reduce(lambda a, b: a.join(b, on=["user_id", "ci"], how="full", coalesce=True), fs)
+T_START, day, merge = time.time(), lambda c: time.strftime("%m-%d", time.gmtime(c / 1000)), lambda fs: functools.reduce(lambda a, b: a.join(b, on=["user_id", "ci"], how="full", coalesce=True), fs)
 def log(m): print(f"[{(time.time() - T_START) / 60:6.1f} мин | пик RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:5.1f} GB] {m}", flush=True)
 eta = lambda i, n, t0, what: log(f"{what} {i + 1}/{n}, осталось ~{(time.time() - t0) / max(i + 1, 1) * max(n - i - 1, 0) / 60:.1f} мин") if (i + 1) % max(1, n // 10) == 0 or i + 1 >= n else None
 
@@ -89,7 +90,8 @@ def window(c, users, univ, first, last, A, parts, walks):
         w = pl.when(pl.col("eid").is_in(CONTACT)).then(W_CONTACT).when(pl.col("eid") == SHOW).then(W_SHOW).otherwise(1.0).cast(pl.Float32)
         win, agg = ev.with_columns(w=w, b=(c - pl.col("timestamp")) // DAY), dict(w=pl.col("w").max(), ts=pl.col("timestamp").max(), contact=pl.col("eid").is_in(CONTACT).any())
         pairs, sess = win.group_by("user_id", "item_id", "ci").agg(**agg), win.group_by("user_id", "item_id", "ci", "b").agg(**agg)
-        cnt, blocks = cnt | {"deg": np.bincount(pairs["ci"].to_numpy(), minlength=n), "nc": np.bincount(pairs.filter("contact")["ci"].to_numpy(), minlength=n)}, {}
+        cnt, blocks = cnt | {"deg": np.bincount(pairs["ci"].to_numpy(), minlength=n), "nc": np.bincount(pairs.filter("contact")["ci"].to_numpy(), minlength=n),
+                             "nu14": np.bincount(pairs.filter(pl.col("ts") >= c - 14 * DAY)["ci"].to_numpy(), minlength=n)}, {}
         for wn in walks:
             src = sess if "b" in WALKS[wn] else pairs
             k = code[wn][src["ci"].to_numpy()] + (src["b"].to_numpy().astype(np.uint64) if "b" in WALKS[wn] else 0)
@@ -97,23 +99,31 @@ def window(c, users, univ, first, last, A, parts, walks):
             h2, h1 = e.group_by("el", maintain_order=True).head(CAP_ENT), e.group_by("ci", maintain_order=True).head(cap_part)
             blocks[wn] = (ssp.csr_matrix((h2["w"].to_numpy(), (h2["el"].to_numpy(), h2["ci"].to_numpy())), shape=(int(e["el"].max()) + 1, n)), h1)
         return cnt, pairs.join(users, on="user_id", how="semi"), sn.drop("item_id"), blocks
-    st = {k: np.zeros(n, np.float32) for k in ("ev1", "ev7", "ev7p", "sh7", "sh7p", "ct7", "deg", "nc")} | {"age": (c - T0) / DAY - first[uni], "last": (c - T0) / DAY - last[uni]}
-    g, mine, seen, t0 = {w: {"h2": [], "h1": [], "ne": 0} for w in walks}, [], [], time.time()
+    st = {k: np.zeros(n, np.float32) for k in ("ev1", "ev7", "ev7p", "sh7", "sh7p", "ct7", "deg", "nc", "nu14")} | {"age": (c - T0) / DAY - first[uni], "last": (c - T0) / DAY - last[uni]}
+    g, mine, seen, t0 = {w: {"bl": [], "h2": [], "h1": [], "ne": 0, "nnz": 0} for w in walks}, [], [], time.time()
+    def flush(G):  # накопленные партиции -> блок (H1: item × сущности блока, H2: сущности блока × item); сущность целиком в одной партиции
+        if G["h2"]: r, cc, v = (xp.concatenate(x) for x in zip(*G["h1"])); G["bl"].append((xsp.coo_matrix((v, (r, cc.astype(xp.int32))), shape=(n, G["ne"])).tocsr(), xsp.vstack(G["h2"]).tocsr()))
+        G.update(h2=[], h1=[], ne=0, nnz=0)
     for k, (cnt, m, sn, blocks) in enumerate(map(part, parts)):
         for name, v in cnt.items(): st[name] += v
         mine.append(m); seen.append(sn)
         for wn, (h2, h1) in blocks.items():  # блоки графа сразу на устройство: на GPU копятся в VRAM, а не в RAM
-            G = g[wn]; G["h2"].append(xsp.csr_matrix(h2)); G["h1"].append(tuple(xp.asarray(h1[col].to_numpy()) + (G["ne"] if col == "el" else 0) for col in ("ci", "el", "w"))); G["ne"] += h2.shape[0]
+            G = g[wn]; flush(G) if G["nnz"] + max(h2.nnz, h1.height) > NNZ_MAX else None
+            G["h2"].append(xsp.csr_matrix(h2)); G["h1"].append(tuple(xp.asarray(h1[col].to_numpy()) + (G["ne"] if col == "el" else 0) for col in ("ci", "el", "w"))); G["ne"] += h2.shape[0]; G["nnz"] += max(h2.nnz, h1.height)
         eta(k, len(parts), t0, f"окно {day(c)} {'+'.join(walks)}: партиция")
     for wn, G in g.items():
-        r, cc, v = (xp.concatenate(x) for x in zip(*G["h1"])); g[wn], ne = (xsp.coo_matrix((v, (r, cc.astype(xp.int32))), shape=(n, G["ne"])).tocsr(), xsp.vstack(G["h2"]).tocsr()), G["ne"]
-        log(f"граф {wn}: {n:,} item, {ne:,} сущностей, nnz {g[wn][0].nnz + g[wn][1].nnz:,}, ~{(g[wn][0].nnz + g[wn][1].nnz) * 8 / 2**30 / len(parts):.3f} GB/партиция")
+        flush(G); g[wn] = G["bl"]; nnz = sum(a.nnz + b.nnz for a, b in g[wn])
+        log(f"граф {wn}: {n:,} item, {sum(b.shape[0] for _, b in g[wn]):,} сущностей, {len(g[wn])} блок(а), nnz {nnz:,}, ~{nnz * 8 / 2**30 / len(parts):.3f} GB/партиция")
     return uni, st, g, pl.concat(mine), pl.concat(seen)
 
-# %% Кандидаты: score_uj = Σ_i x_ui (H1 H2)_ij / pop_j^β (x — свежесть затравок), top-NOUT невиденных на юзера
-def norm_rows(m):  # строки — в вероятности перехода (scipy и cupyx); без diag @ m: cuSPARSE spGEMM падает на 4М строк
-    m = m.tocsr(); s = xp.maximum(xp.asarray(m.sum(axis=1)).ravel(), 1e-9)  # сумма по CSR: без сортировки (lexsort на 2 млрд nnz — bad_alloc)
+# %% Кандидаты: score_uj = Σ_блоков Σ_i x_ui (H1 H2)_ij (x — свежесть затравок), top-NOUT невиденных на юзера
+def norm_rows(m, s=None):  # строки — в вероятности перехода; s — суммы строк по всем блокам. Без diag @ m (cuSPARSE spGEMM падает на 4М строк)
+    s = xp.maximum(xp.asarray(m.sum(axis=1)).ravel() if s is None else s, 1e-9)  # сумма по CSR: без сортировки (lexsort на 2 млрд nnz — bad_alloc)
     m.data = (m.data / s[m.tocoo().row]).astype(xp.float32); return m
+
+def bm25(H1, H2, rs):  # веса BM25 на месте (эксп. 6е): item — документ, юзер — терм; rs — вес item по всем блокам
+    idf, ln = math.log(len(rs)) - xp.log1p(xp.diff(H2.indptr).astype(xp.float32)), (1 - B) + B * rs / rs.mean(); f = lambda w, it, us: (w * (K1 + 1) / (K1 * ln[it] + w) * idf[us]).astype(xp.float32)
+    H1.data, H2.data = f(H1.data, H1.tocoo().row, H1.indices), f(H2.data, H2.indices, H2.tocoo().row)
 
 def topn(rows, cols, vals, n):  # одна сортировка по ключу «строка + (0.5 − доля скора)»
     if not len(rows): return [cpu(rows)] * 4
@@ -121,29 +131,44 @@ def topn(rows, cols, vals, n):  # одна сортировка по ключу 
     rank = xp.arange(len(r)) - xp.searchsorted(r, xp.arange(int(r.max()) + 1))[r]
     return [cpu(a[rank < n]) for a in (r, cc, v, rank)]
 
-def candidates(c, g, st, mine, seen, batch):
+def score(X, bl, name, uid, sk, n, batch):  # top-NOUT невиденных item на юзера по сумме блоков
+    res, t0, lo, j = [], time.time(), 0, 0
+    while lo < X.shape[0]:
+        try: S = functools.reduce(lambda a, b: a + b, [(X[lo : lo + batch] @ H1) @ H2 for H1, H2 in bl]).tocoo()
+        except Exception as ex:  # нехватка памяти GPU -> батч вдвое меньше
+            if batch == 1 or not any(k in str(ex) for k in OOM): raise
+            batch //= 2; log(f"нехватка памяти -> батч {batch}"); continue
+        r, cc = S.row.astype(xp.int64) + lo, S.col.astype(xp.int64); keep = sk[xp.minimum(xp.searchsorted(sk, r * n + cc), len(sk) - 1)] != r * n + cc  # минус виденное
+        rr, ii, vv, rk = topn(r[keep], cc[keep], S.data[keep], NOUT); res.append(pl.DataFrame({"user_id": uid[rr], "ci": ii.astype(np.int32), f"{name}_s": vv, f"{name}_r": rk.astype(np.uint16)}))
+        lo, j = lo + batch, j + 1; eta(j - 1, j + math.ceil((X.shape[0] - lo) / batch), t0, f"{name}: батч")
+    return pl.concat(res)
+
+def candidates(c, g, st, mine, seen, batch):  # на графе s24 ещё co-visitation (сырые веса), на u0 — BM25, затем блуждание (нормированные строки)
     um = mine.select("user_id").unique().sort("user_id").with_row_index("ui")
     sd = (mine.join(um, on="user_id").with_columns(x=pl.col("w") * (-(c - pl.col("ts")) / (TAU * DAY)).exp())
           .sort("x", descending=True).group_by("user_id", maintain_order=True).head(SEEDS))
     n, uid, out = len(st["deg"]), um["user_id"].to_numpy(), []
     X = norm_rows(xsp.csr_matrix(ssp.csr_matrix((sd["x"].to_numpy(), (sd["ui"].to_numpy(), sd["ci"].to_numpy())), shape=(um.height, n))))
     sk = xp.asarray(np.append(seen.join(um, on="user_id").select(pl.col("ui").cast(pl.Int64) * n + pl.col("ci")).to_series().sort().to_numpy(), -1))
-    for wn, (H1, H2) in g.items():
-        pop = xp.maximum(xp.bincount(H2.indices, minlength=n), 1).astype(xp.float32)  # число сущностей у item
-        H1, H2, res, t0, lo, j = norm_rows(H1), norm_rows(H2), [], time.time(), 0, 0
-        while lo < um.height:
-            try:
-                S = ((X[lo : lo + batch] @ H1) @ H2).tocoo()
-            except Exception as ex:  # нехватка памяти GPU -> батч вдвое меньше
-                if batch == 1 or not any(k in str(ex) for k in ("emory", "ALLOC", "RESOURCES")): raise
-                batch //= 2; log(f"нехватка памяти -> батч {batch}"); continue
-            r, cc = S.row.astype(xp.int64) + lo, S.col.astype(xp.int64)
-            keep = sk[xp.minimum(xp.searchsorted(sk, r * n + cc), len(sk) - 1)] != r * n + cc  # убрать уже виденное
-            rr, ii, vv, rk = topn(r[keep], cc[keep], S.data[keep] / pop[cc[keep]] ** BETA, NOUT)
-            res.append(pl.DataFrame({"user_id": uid[rr], "ci": ii.astype(np.int32), f"{wn}_s": vv, f"{wn}_r": rk.astype(np.uint16)}))
-            lo, j = lo + batch, j + 1; eta(j - 1, j + math.ceil((um.height - lo) / batch), t0, f"блуждание {wn}: батч")
-        out.append(pl.concat(res)); cp.get_default_memory_pool().free_all_blocks() if GPU else None
+    sc = lambda bl, name: out.append(score(X, bl, name, uid, sk, n, batch))
+    for wn, bl in g.items():
+        if wn == "s24": sc(bl, "covis")
+        if wn == "u0":  # BM25 на месте, затем исходные веса обратно (копия только данных, не графа)
+            raw, rs = [(a.data.copy(), b.data.copy()) for a, b in bl], functools.reduce(xp.add, [xp.bincount(b.indices, weights=b.data, minlength=n) for _, b in bl])
+            [bm25(a, b, rs) for a, b in bl]; sc(bl, "bm25")
+            for (a, b), (da, db) in zip(bl, raw): a.data, b.data = da, db
+        s1, raw = functools.reduce(xp.add, [xp.asarray(a.sum(axis=1)).ravel() for a, _ in bl]), None  # строки H1 — по всем блокам
+        for a, b in bl: norm_rows(a, s1); norm_rows(b)
+        sc(bl, wn); cp.get_default_memory_pool().free_all_blocks() if GPU else None
     return merge(out)
+
+def seg_pop(mine, st, uni, A, seen):  # популярное по nu14 в главных сегментах s0 × loc юзера (класс промахов B, эксп. 6д); скор = доля юзера × log1p(nu14)
+    key = lambda ci: A["s0"][uni[ci]].astype(np.int64) * 65536 + A["loc"][uni[ci]]
+    aff = (mine.with_columns(g=key(mine["ci"].to_numpy())).group_by("user_id", "g").agg(pl.col("w").sum()).with_columns(sh=pl.col("w") / pl.col("w").sum().over("user_id"))
+           .sort(["user_id", "sh"], descending=[False, True]).group_by("user_id", maintain_order=True).head(SP[0])); ci = np.flatnonzero(st["nu14"] > 0)
+    top = pl.DataFrame({"ci": ci.astype(np.int32), "g": key(ci), "p": st["nu14"][ci]}).sort("p", descending=True).group_by("g", maintain_order=True).head(SP[1])
+    df = aff.join(top, on="g").join(seen, on=["user_id", "ci"], how="anti").group_by("user_id", "ci").agg(sp_s=(pl.col("sh") * pl.col("p").log1p()).max().cast(pl.Float32))
+    return df.sort(["user_id", "sp_s"], descending=[False, True]).group_by("user_id", maintain_order=True).head(SP[2]).with_columns(sp_r=pl.int_range(pl.len()).over("user_id").cast(pl.UInt16))
 
 def stage(c, users, un, A, parts, batch):  # все графы за один проход, если помещаются в память; при нехватке — по проходу на граф
     est = len(parts) * GB_PER_PART * len(WALKS)
@@ -152,9 +177,9 @@ def stage(c, users, un, A, parts, batch):  # все графы за один п�
         try:
             for grp in groups:
                 uni, st, g, mine, seen = window(c, users, un[str(c)], un["first"], un[f"last{c}"], A, parts, grp); cands.append(candidates(c, g, st, mine, seen, batch)); del g
-            return uni, st, mine, merge(cands)
+            return uni, st, mine, merge(cands + [seg_pop(mine, st, uni, A, seen)])
         except Exception as ex:  # нехватка памяти при одном проходе -> по проходу на граф
-            if len(groups) > 1 or ("emory" not in str(ex) and "ALLOC" not in str(ex)): raise
+            if len(groups) > 1 or not any(k in str(ex) for k in OOM): raise
             g = None; cp.get_default_memory_pool().free_all_blocks() if GPU else None
 
 # %% Признаки, ранкер
@@ -197,8 +222,8 @@ def pipeline(parts, out, frac=1.0, iters=3000, batch=512 if GPU else 256):
         uni, st, mine, cand = stage(T1, tgt.select("user_id").unique(), un, A, parts, batch)
         cand = cand.with_columns(item_id=uni[cand["ci"].to_numpy()]).join(tgt.with_columns(target=pl.lit(1, pl.Int8)), on=["user_id", "item_id"], how="left").with_columns(pl.col("target").fill_null(0))
         log(f"W1: {cand.height:,} кандидатов, потолок пула {cand['target'].sum() / tgt.height:.4f}")
-        cand = cand.join(cand.filter(pl.col("target") == 1).select("user_id").unique(), on="user_id").sort("user_id", "ci")  # группы без позитивов не учат
-        cand = cand.filter((pl.col("target") == 1) | (pl.int_range(pl.len()).shuffle(seed=SEED).over("user_id") < NEG)).drop("item_id")
+        cand = cand.join(cand.filter(pl.col("target") == 1).select("user_id").unique(), on="user_id")  # группы без позитивов не учат; негативы — по хэшу пары, не по позиции строки (эксп. 6г)
+        cand = cand.filter((pl.col("target") == 1) | (pl.struct("user_id", "ci").hash(SEED).rank("ordinal").over("user_id") <= NEG)).drop("item_id")
         fit(featurize(cand, T1, uni, st, mine, A), iters).save_model(ck("model.cbm")); del mine, cand
     m = CatBoostRanker().load_model(ck("model.cbm"))
     if not os.path.exists(ck("top160.parquet")):
@@ -225,5 +250,5 @@ shutil.rmtree(f"{OUT}/smoke", ignore_errors=True)
 smoke = pipeline(PARTS[:1], f"{OUT}/smoke", frac=0.03, iters=30)
 assert 0 < smoke["recall@160"] < 1 and smoke["users"] > 50, smoke
 
-# %% Полный прогон (SAMPLE=1.0: оценка ~1.5–2 ч на 80 GB VRAM / 64 GB RAM)
+# %% Полный прогон (замер: SAMPLE=0.75 — 89 мин на A100 80 GB до добавления covis/BM25/sp и NOUT 1000; теперь ожидать ~×1.5)
 res = pipeline(PARTS, f"{OUT}/sample_{SAMPLE}")
