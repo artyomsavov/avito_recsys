@@ -21,6 +21,6 @@ for chunk in re.split(r"^# %%", src, flags=re.M)[1:]:
 for i, c in enumerate(cells):
     c["id"] = f"cell-{i:02d}"
 nb = {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                                   "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 5}
+                                   "language_info": {"name": "python", "file_extension": ".py", "mimetype": "text/x-python"}}, "nbformat": 4, "nbformat_minor": 5}
 json.dump(nb, open("final.ipynb", "w"), ensure_ascii=False, indent=1)
 print(f"final.ipynb: {len(cells)} ячеек, {code_lines} непустых строк кода (вместе с комментариями, без markdown)")

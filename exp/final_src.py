@@ -4,9 +4,11 @@
 # популярное в сегментах s0 × loc юзера; ранжирование — CatBoost YetiRank.
 # Ранкер учится на неделе до порога (W1), тест — неделя после (W0, таргет по логике организаторов).
 # Меняется только `SAMPLE`: 0.01 — одна партиция (ноутбук), 1.0 — весь датасет (сервер).
+# `USERS` — доля юзеров окон W1/W0 (по хэшу): память под кандидаты и признаки линейна по ней, граф строится по всем данным.
 
 # %% Конфиг и зависимости
 SAMPLE = 0.01
+USERS = 1.0
 import functools, importlib.metadata as md, json, math, os, resource, shutil, subprocess, sys, time
 GPU = shutil.which("nvidia-smi") is not None
 PKGS = {"polars": "1.40.1", "numpy": "2.4.4", "scipy": "1.17.1", "pandas": "3.0.3", "pyarrow": "24.0.0", "catboost": "1.2.10"} | ({"cupy-cuda12x": "14.2.0"} if GPU else {})
@@ -251,4 +253,4 @@ smoke = pipeline(PARTS[:1], f"{OUT}/smoke", frac=0.03, iters=30)
 assert 0 < smoke["recall@160"] < 1 and smoke["users"] > 50, smoke
 
 # %% Полный прогон (замер: SAMPLE=0.75 — 89 мин на A100 80 GB до добавления covis/BM25/sp и NOUT 1000; теперь ожидать ~×1.5)
-res = pipeline(PARTS, f"{OUT}/sample_{SAMPLE}")
+res = pipeline(PARTS, f"{OUT}/sample_{SAMPLE}" + (f"_users_{USERS}" if USERS < 1 else ""), frac=USERS)
