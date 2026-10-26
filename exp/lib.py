@@ -357,6 +357,106 @@ def bucket_pop_source(ctx, users, items, n_out, days=7):
             .select("user_id", "item_id", pl.col("len").cast(pl.Float32).alias("bp_s"), "bp_r"))
 
 
+def seg_pop_source(ctx, users, items, n_out=300, keys=("s0", "loc"), top_seg=20, per_seg=100, name="sp"):
+    """Класс B (эксп. 6б): популярное по nu14 в сегментах keys юзера; скор = доля веса юзера в сегменте × log1p(nu14)."""
+    aff = (ctx.pairs.join(users, on="user_id", how="semi").join(items.select("item_id", *keys), on="item_id")
+           .group_by("user_id", *keys).agg(pl.col("w").sum())
+           .with_columns(share=pl.col("w") / pl.col("w").sum().over("user_id"))
+           .sort(["user_id", "share"], descending=[False, True]).group_by("user_id", maintain_order=True).head(top_seg))
+    top = (items.select("item_id", *keys).join(ctx.istat.select("item_id", "nu14"), on="item_id")  # istat — только universe
+           .filter(pl.col("nu14") > 0).sort("nu14", descending=True).group_by(*keys, maintain_order=True).head(per_seg))
+    df = (aff.join(top, on=list(keys)).join(ctx.seen, on=["user_id", "item_id"], how="anti")
+          .with_columns(s=(pl.col("share") * pl.col("nu14").cast(pl.Float32).log1p()).cast(pl.Float32))
+          .group_by("user_id", "item_id").agg(pl.col("s").max()))
+    return (df.sort(["user_id", "s"], descending=[False, True]).group_by("user_id", maintain_order=True).head(n_out)
+            .with_columns(pl.int_range(pl.len()).over("user_id").cast(pl.UInt16).alias(f"{name}_r"))
+            .select("user_id", "item_id", pl.col("s").alias(f"{name}_s"), f"{name}_r"))
+
+
+def old_seeds(ev, ctx, users, hist_days, old_days=90, w_contact=3.0, w_show=0.3):
+    """Класс U (эксп. 6): seed-ы из истории старше hist_days для юзеров без событий в окне графа."""
+    c = ctx.c
+    u = users.join(ctx.pairs.select("user_id").unique(), on="user_id", how="anti")
+    return (ev.filter((pl.col("timestamp") < c - hist_days * DAY) & (pl.col("timestamp") >= c - old_days * DAY))
+            .join(u, on="user_id", how="semi").with_columns(event_weight(w_contact, w_show).alias("w"))
+            .group_by("user_id", "item_id").agg(pl.col("w").max(), pl.col("timestamp").max().alias("ts")))
+
+
+class Cooc:
+    """Co-visitation и BM25 (эксп. 6в): seed-ы юзера X × H1 × H2, как у блуждания, но с другими весами.
+      covis — item ↔ сессия (юзер × день, последние sess_cap item), сырые веса событий;
+      bm25  — item ↔ юзер, веса BM25 (документ — item, термы — юзеры).
+    Два режима: source() — top-n новых item на юзера; feature() — точный скор для заданных пар."""
+
+    def __init__(self, ctx, sess, users, seeds=100, tau=7.0, sess_cap=30, k1=100.0, b=0.8):
+        self.c, self.users = ctx.c, users.select("user_id").unique().sort("user_id").with_row_index("ui")
+        self.imap = pl.concat([ctx.pairs.select("item_id"), ctx.universe]).unique().sort("item_id").with_row_index("ii")
+        ni, nu = self.imap.height, self.users.height
+        self.allowed = np.zeros(ni, bool)
+        self.allowed[self.imap.join(ctx.universe, on="item_id")["ii"].to_numpy()] = True
+        sd = (ctx.pairs.join(self.users, on="user_id").join(self.imap, on="item_id")
+              .with_columns(x=pl.col("w") * (-(ctx.c - pl.col("ts")) / (tau * DAY)).exp())
+              .sort("x", descending=True).group_by("user_id", maintain_order=True).head(seeds))
+        X = sp.csr_matrix((sd["x"].to_numpy().astype(np.float32), (sd["ui"].to_numpy(), sd["ii"].to_numpy())), shape=(nu, ni))
+        self.X = (sp.diags(1 / np.maximum(np.asarray(X.sum(axis=1)).ravel(), 1e-9)).astype(np.float32) @ X).tocsr()
+        seen = ctx.seen.join(self.users, on="user_id").join(self.imap, on="item_id")
+        self.seen_key = np.sort(seen["ui"].to_numpy().astype(np.int64) * ni + seen["ii"].to_numpy())
+        ss = (sess.join(self.imap, on="item_id").sort("ts", descending=True).group_by("user_id", "b", maintain_order=True).head(sess_cap)
+              .with_columns(si=pl.struct("user_id", "b").rank("dense") - 1))
+        S = sp.csr_matrix((ss["w"].to_numpy().astype(np.float32), (ss["si"].to_numpy(), ss["ii"].to_numpy())), shape=(int(ss["si"].max()) + 1, ni))
+        pr = ctx.pairs.join(self.imap, on="item_id").with_columns(uj=pl.col("user_id").rank("dense") - 1)
+        M = sp.csr_matrix((pr["w"].to_numpy().astype(np.float32), (pr["ii"].to_numpy(), pr["uj"].to_numpy())), shape=(ni, int(pr["uj"].max()) + 1)).tocoo()
+        idf = (np.log(M.shape[0]) - np.log1p(np.bincount(M.col, minlength=M.shape[1]))).astype(np.float32)
+        rs = np.asarray(M.sum(axis=1)).ravel()
+        ln = (1 - b) + b * rs / max(rs.mean(), 1e-9)
+        M.data = (M.data * (k1 + 1) / (k1 * ln[M.row] + M.data) * idf[M.col]).astype(np.float32)
+        M = M.tocsr()
+        self.mats = {"covis": (S.T.tocsr(), S), "bm25": (M, M.T.tocsr())}
+
+    def _batches(self, kind, batch=256):
+        H1, H2 = self.mats[kind]
+        for s in range(0, self.users.height, batch):
+            yield s, ((self.X[s : s + batch] @ H1) @ H2).tocsr()
+
+    def source(self, kind, n_out=1000):
+        ni, out = self.imap.height, []
+        for s, S in self._batches(kind):
+            S = S.tocoo()
+            r, c, v = S.row.astype(np.int64) + s, S.col.astype(np.int64), S.data
+            k = r * ni + c
+            pos = np.minimum(np.searchsorted(self.seen_key, k), len(self.seen_key) - 1)
+            m = self.allowed[c] & (self.seen_key[pos] != k) & (v > 0)
+            df = pl.DataFrame({"ui": r[m].astype(np.uint32), "ii": c[m].astype(np.uint32), "s": v[m]})
+            out.append(df.sort(["ui", "s"], descending=[False, True]).group_by("ui", maintain_order=True).head(n_out)
+                       .with_columns(pl.int_range(pl.len()).over("ui").cast(pl.UInt16).alias(f"{kind}_r")))
+        return (pl.concat(out).join(self.users, on="ui").join(self.imap, on="ii")
+                .select("user_id", "item_id", pl.col("s").cast(pl.Float32).alias(f"{kind}_s"), f"{kind}_r"))
+
+    def feature(self, kind, pairs, batch=256):
+        """Скор kind для каждой пары (user_id, item_id); нет пути — 0."""
+        p = pairs.select("user_id", "item_id").join(self.users, on="user_id").join(self.imap, on="item_id", how="left").sort("ui")
+        ui, ii = p["ui"].to_numpy().astype(np.int64), p["ii"].fill_null(0).to_numpy().astype(np.int64)
+        has, val = p["ii"].is_not_null().to_numpy(), np.zeros(p.height, np.float32)
+        bounds = np.searchsorted(ui, np.arange(0, self.users.height + batch, batch))
+        for j, (s, S) in enumerate(self._batches(kind, batch)):
+            lo, hi = bounds[j], bounds[j + 1]
+            if hi > lo:
+                val[lo:hi] = np.asarray(S[ui[lo:hi] - s, ii[lo:hi]]).ravel() * has[lo:hi]
+        return p.select("user_id", "item_id").with_columns(pl.Series(f"{kind}_f", val))
+
+
+def closed_cat(ev, c, items, users, hist_days=28):
+    """Этап C: «категория закрыта» (1 место: +0.01). На (юзер, cat): дни с последнего контакта в cat,
+    активных событий (без показов) в cat после него, флаг «был контакт ≥ 1 дня назад и после — тишина»."""
+    e = (ev.filter((pl.col("timestamp") < c) & (pl.col("timestamp") >= c - hist_days * DAY) & (pl.col("eid") != SHOW))
+         .join(users, on="user_id", how="semi").join(items.select("item_id", "cat"), on="item_id"))
+    last = e.filter(pl.col("eid").is_in(CONTACT)).group_by("user_id", "cat").agg(_ct=pl.col("timestamp").max())
+    after = e.join(last, on=["user_id", "cat"]).filter(pl.col("timestamp") > pl.col("_ct")).group_by("user_id", "cat").agg(cc_after=pl.len().cast(pl.UInt32))
+    return (last.join(after, on=["user_id", "cat"], how="left").with_columns(pl.col("cc_after").fill_null(0))
+            .with_columns(cc_ago=((c - pl.col("_ct")) / DAY).cast(pl.Float32))
+            .with_columns(cc_closed=((pl.col("cc_after") == 0) & (pl.col("cc_ago") >= 1)).cast(pl.Int8)).drop("_ct"))
+
+
 def featurize(cands, ctx, items, aff=True, dyn=True, oracle=None):
     c = ctx.c
     users = cands.select("user_id").unique()
@@ -396,14 +496,23 @@ def label(df, tgt):
     )
 
 
-def train_ranker(tr, neg=200, holdout=0.1, iters=2000, lr=0.08, depth=6, loss="YetiRank", seed=42, task="CPU", verbose=200):
+def train_ranker(tr, neg=200, holdout=0.1, iters=2000, lr=0.08, depth=6, loss="YetiRank", seed=42, task="CPU", verbose=200, hard=0.0):
     from catboost import CatBoostRanker, Pool
 
     pos_users = tr.filter(pl.col("target") == 1).select("user_id").unique()
     tr = tr.join(pos_users, on="user_id", how="semi")
-    tr = tr.with_columns(pl.int_range(pl.len()).shuffle(seed=seed).over("user_id").alias("_k")).filter(
-        (pl.col("target") == 1) | (pl.col("_k") < neg)
-    ).drop("_k")
+    if hard:  # этап C: доля hard негативов — лучшие по рангу источников, остальные случайные
+        h = int(neg * hard)
+        best = pl.min_horizontal([pl.col(c) for c in tr.columns if c.endswith("_r")])
+        tr = tr.with_columns(_hk=pl.when(pl.col("target") == 0).then(best).otherwise(None))
+        tr = tr.with_columns(_hk=(pl.col("_hk").rank("ordinal").over("user_id") - 1)).with_columns(
+            _hard=pl.col("_hk") < h).drop("_hk")
+        neg = neg - h
+    # случайный порядок по хэшу пары, а не по позиции строки: shuffle().over() на кандидатах,
+    # отсортированных по рангу источника, выбирал негативы неслучайно (−0.02 Recall, эксперимент 6г)
+    tr = tr.with_columns(pl.struct("user_id", "item_id").hash(seed).rank("ordinal").over("user_id").alias("_k") - 1).filter(
+        (pl.col("target") == 1) | (pl.col("_k") < neg) | (pl.col("_hard") if "_hard" in tr.columns else pl.lit(False))
+    ).drop("_k", "_hard", strict=False)
     uu = pos_users.sort("user_id").sample(fraction=1.0, shuffle=True, seed=seed)["user_id"]
     hold = set(uu[: int(len(uu) * holdout)].to_list())
     feats = [c for c in tr.columns if c not in DROP]
